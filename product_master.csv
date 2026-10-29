@@ -1,0 +1,6 @@
+﻿sku,product_name,unit_cost_krw,list_price_krw,list_price_usd,lead_time_domestic_days,lead_time_fba_days,moq_units,fba_fee_usd,fba_storage_fee_usd_per_unit_month
+A-SRM-100,발효 퍼스트 앰플 100ml,9500,38000,29.9,14,35,500,5.4,0.08
+A-CRM-050,장벽 크림 50ml,10500,42000,39.9,14,35,500,4.9,0.05
+A-CAP-HY,수분 캡슐 앰플 40caps,11250,45000,39.9,14,35,500,4.9,0.05
+A-CAP-VC,광채 캡슐 앰플 40caps,11250,45000,39.9,14,35,500,4.9,0.05
+A-CAP-PN,진정 캡슐 앰플 40caps,11250,45000,39.9,14,35,500,4.9,0.05

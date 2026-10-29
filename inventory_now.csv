@@ -1,0 +1,11 @@
+﻿as_of,location,used_by,sku,product_name,on_hand,open_po_qty,lead_time_days,moq
+2026-07-26,AMZ_FBA,amazon_us,A-CAP-HY,수분 캡슐 앰플 40caps,139,710,35,500
+2026-07-26,KR_WH,"own_mall, coupang, naver",A-CAP-HY,수분 캡슐 앰플 40caps,1187,800,14,500
+2026-07-26,AMZ_FBA,amazon_us,A-CAP-PN,진정 캡슐 앰플 40caps,0,4000,35,500
+2026-07-26,KR_WH,"own_mall, coupang, naver",A-CAP-PN,진정 캡슐 앰플 40caps,301,800,14,500
+2026-07-26,AMZ_FBA,amazon_us,A-CAP-VC,광채 캡슐 앰플 40caps,146,808,35,500
+2026-07-26,KR_WH,"own_mall, coupang, naver",A-CAP-VC,광채 캡슐 앰플 40caps,766,1200,14,500
+2026-07-26,AMZ_FBA,amazon_us,A-CRM-050,장벽 크림 50ml,145,846,35,500
+2026-07-26,KR_WH,"own_mall, coupang, naver",A-CRM-050,장벽 크림 50ml,1736,1300,14,500
+2026-07-26,AMZ_FBA,amazon_us,A-SRM-100,발효 퍼스트 앰플 100ml,468,2365,35,500
+2026-07-26,KR_WH,"own_mall, coupang, naver",A-SRM-100,발효 퍼스트 앰플 100ml,3492,2500,14,500
