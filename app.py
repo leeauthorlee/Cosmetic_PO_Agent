@@ -3,6 +3,10 @@
 # ==========================================
 
 import uuid
+import base64
+import altair as alt
+import json
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -31,9 +35,9 @@ from pathlib import Path
 load_dotenv()
 
 st.set_page_config(
-    page_title="재고 주문량 관리 챗봇",
+    page_title="SIL | 구매 업무 어시스턴트",
     page_icon="📦",
-    layout="centered"
+    layout="wide"
 )
 
 
@@ -387,72 +391,119 @@ if "thread_id" not in st.session_state:
 
 
 # ==========================================
-# 6. 재고 주문 보고서 팝업
+# 6. 출력 전용 데이터 변환 및 보고서
 # ==========================================
 
-@st.dialog(
-    "📋 재고 주문 보고서",
-    width="large"
-)
+CHANNELS = {
+    "channel_amazon_us": "Amazon US",
+    "channel_coupang": "쿠팡",
+    "channel_naver": "네이버",
+    "channel_own_mall": "자사몰",
+}
+
+
+def extract_display_results(messages):
+    """이번 응답의 도구 반환값과 호출 인자만 화면용 행으로 변환합니다."""
+    # 체크포인터가 반환하는 과거 대화의 결과를 이번 결과에 섞지 않습니다.
+    start = next((i for i in range(len(messages) - 1, -1, -1)
+                  if getattr(messages[i], "type", None) == "human"), -1)
+    calls, sales, orders = {}, [], []
+    for message in messages[start + 1:]:
+        for call in getattr(message, "tool_calls", []) or []:
+            calls[call["id"]] = call
+        if getattr(message, "type", None) != "tool":
+            continue
+        if getattr(message, "status", None) == "error":
+            continue
+        call = calls.get(getattr(message, "tool_call_id", None), {})
+        args = call.get("args", {})
+        name = getattr(message, "name", None)
+        content = message.content
+        if name == "predict_sales" and isinstance(content, str):
+            # 현재 도구의 문장 형식을 명시적으로 지원합니다. 임의의 숫자는 추정하지 않습니다.
+            match = re.fullmatch(r"(.+?)의 1주의, 2주, 3주의 예상 판매량은 (\d+)개입니다\.", content.strip())
+            if match:
+                active = [label for flag, label in CHANNELS.items()
+                          if args.get(flag, 1 if flag == "channel_amazon_us" else 0) == 1]
+                channel = active[0] if len(active) == 1 else "채널 구분 불가"
+                for week in range(1, 4):
+                    sales.append({"SKU": match[1], "판매 사이트": channel,
+                                  "기간": f"{week}주차", "예상 판매량(개)": int(match[2])})
+        elif name == "check_inventory":
+            try:
+                result = json.loads(content) if isinstance(content, str) else content
+                values = [result[key] for key in ("predicted_sales", "required_qty", "order_qty")]
+                if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                           and math.isfinite(v) and v >= 0 for v in values):
+                    continue
+                # 기존 check_inventory는 KR_WH를 조회하므로 국내 결과로만 표시합니다.
+                orders.append({"SKU": args.get("sku", "미확인"), "지역": "국내",
+                               "창고": "KR_WH", "예상 판매량(개)": values[0],
+                               "부족 수량(개)": values[1], "주문량(개)": values[2]})
+            except (ValueError, TypeError, KeyError):
+                continue
+    return {"sales": sales, "orders": orders}
+
+
+def render_results(results, key):
+    sales, orders = results.get("sales", []), results.get("orders", [])
+    if sales:
+        st.markdown("#### 판매량 예측")
+        site = st.segmented_control("판매 사이트", ["전체", *CHANNELS.values()],
+                                    default="전체", key=f"site_{key}") or "전체"
+        frame = pd.DataFrame(sales)
+        if site != "전체":
+            frame = frame[frame["판매 사이트"] == site]
+        if frame.empty:
+            st.info("선택한 판매 사이트의 조회 결과가 없습니다.")
+        else:
+            st.metric("조회된 예상 판매량", f"{frame['예상 판매량(개)'].sum():,.0f}개")
+            plot = frame.copy()
+            plot["제품 · 사이트"] = plot["SKU"] + " · " + plot["판매 사이트"]
+            chart = alt.Chart(plot).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+                x=alt.X("기간:N", title=None, sort=["1주차", "2주차", "3주차"]),
+                y=alt.Y("예상 판매량(개):Q", title="판매량(개)"),
+                xOffset="제품 · 사이트:N",
+                color=alt.Color("제품 · 사이트:N", scale=alt.Scale(range=["#FFBCA6", "#DFA18C", "#BE8170", "#8D655B"]),
+                                legend=alt.Legend(title=None, orient="bottom", labelFontSize=16)),
+                tooltip=["SKU", "판매 사이트", "기간", "예상 판매량(개)"]
+            ).properties(height=220).configure_view(strokeWidth=0).configure_axis(
+                gridColor="#F4E6E0", domain=False, labelColor="#796B65", titleColor="#796B65",
+                labelFontSize=16, titleFontSize=16)
+            st.altair_chart(chart, width="stretch")
+            with st.expander("판매량 상세 표", expanded=False):
+                st.dataframe(frame, hide_index=True, width="stretch")
+        st.caption("현재 판매량 도구는 1~3주 고정 예시값을 반환합니다. 실제 예측 모델 결과가 아닙니다.")
+    if orders:
+        if sales:
+            st.divider()
+        st.markdown("#### 재고 주문 제안")
+        region = st.segmented_control("주문 지역", ["전체", "국내", "국외"],
+                                      default="전체", key=f"region_{key}") or "전체"
+        frame = pd.DataFrame(orders)
+        if region != "전체":
+            frame = frame[frame["지역"] == region]
+        if frame.empty:
+            st.info("국외 주문량 결과가 없습니다. 현재 도구는 국내 창고(KR_WH)만 조회합니다.")
+        else:
+            c1, c2 = st.columns(2)
+            c1.metric("부족 수량", f"{frame['부족 수량(개)'].sum():,.0f}개")
+            c2.metric("추천 주문량", f"{frame['주문량(개)'].sum():,.0f}개")
+            st.dataframe(frame, hide_index=True, width="stretch")
+            st.download_button("CSV 저장", icon=":material/download:",
+                               data=frame.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="sil_inventory_order.csv", mime="text/csv",
+                               key=f"download_{key}", on_click="ignore")
+            st.caption("표시된 주문 내역을 저장합니다. 실제 발주는 실행되지 않습니다.")
+
+
+@st.dialog("재고 주문 보고서", width="large")
 def show_order_report():
-
-    final_answer = st.session_state.final_answer
-    order_quantity = st.session_state.order_quantity
-
-    # --------------------------------------
-    # 6-1. 최종 AI 답변
-    # --------------------------------------
-
-    st.subheader("AI 분석 결과")
-
-    if final_answer is None:
-        st.warning("생성된 AI 답변이 없습니다.")
+    results = st.session_state.get("display_results", {})
+    if not results.get("orders"):
+        st.info("재고 주문량을 질문하면 주문 내역과 CSV 저장 버튼이 표시됩니다.")
         return
-
-    st.write(final_answer)
-
-    st.divider()
-
-    # --------------------------------------
-    # 6-2. 재고 주문 내역
-    # --------------------------------------
-
-    st.subheader("재고 주문 내역")
-
-    if order_quantity is None:
-
-        st.warning(
-            "주문량 예측 결과가 없어 CSV를 생성할 수 없습니다."
-        )
-
-        return
-
-    df = pd.DataFrame({
-        "주문량": [order_quantity]
-    })
-
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.divider()
-
-    # --------------------------------------
-    # 6-3. CSV 다운로드
-    # --------------------------------------
-
-    csv_data = create_order_csv(order_quantity)
-
-    st.download_button(
-        label="💾 저장하기",
-        data=csv_data,
-        file_name="inventory_order.csv",
-        mime="text/csv",
-        use_container_width=True,
-        on_click="ignore"
-    )
+    render_results({"orders": results["orders"]}, "report")
 
 
 # ==========================================
@@ -478,6 +529,7 @@ def send_message():
     # 이전 예측 결과 초기화
     st.session_state.final_answer = None
     st.session_state.order_quantity = None
+    st.session_state.display_results = {}
 
     # --------------------------------------
     # 7-2. Agent 실행
@@ -514,29 +566,12 @@ def send_message():
             "content": answer
         })
 
-        # ----------------------------------
-        # 7-4. Tool 결과 추출
-        # ----------------------------------
-
-        tool_results = [
-            msg
-            for msg in response["messages"]
-            if getattr(msg, "type", None) == "tool"
-            and getattr(msg, "name", None) == "predict_order"
-        ]
-
-        if tool_results:
-
-            try:
-
-                order_quantity = int(
-                    tool_results[-1].content
-                )
-
-                st.session_state.order_quantity = order_quantity
-
-            except (ValueError, TypeError):
-                st.session_state.order_quantity = None
+        # 도구 실행은 그대로 유지하고, 반환 메시지만 화면용으로 변환합니다.
+        display_results = extract_display_results(response["messages"])
+        st.session_state.display_results = display_results
+        st.session_state.messages[-1]["results"] = display_results
+        if display_results["orders"]:
+            st.session_state.order_quantity = display_results["orders"][-1]["주문량(개)"]
 
     except Exception as e:
 
@@ -550,104 +585,202 @@ def send_message():
 
 
 # ==========================================
-# 8. Streamlit 화면 구성
+# 8. SIL 구매 워크스페이스 — 출력 및 탐색 UI
 # ==========================================
 
-st.title("재고 주문량 관리 챗봇")
+def start_new_chat():
+    # 기존 대화는 화면 보관함에 남기고 새 thread_id로 기존 에이전트를 이용합니다.
+    if st.session_state.messages:
+        archive = st.session_state.setdefault("chat_archive", [])
+        archive.append({"messages": list(st.session_state.messages),
+                        "thread_id": st.session_state.thread_id,
+                        "results": st.session_state.get("display_results", {})})
+    st.session_state.messages = []
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.final_answer = None
+    st.session_state.order_quantity = None
+    st.session_state.display_results = {}
+    st.session_state.pop("analysis_choice", None)
 
 
-# ------------------------------------------
-# 8-1. 하단 입력창 고정 CSS
-# ------------------------------------------
-
-st.markdown(
-    """
-    <style>
-
-    /* 대화 내용이 하단 입력창에 가려지지 않도록 여백 확보 */
-    .block-container {
-        padding-bottom: 120px;
-    }
-
-    /* 입력창 전체를 화면 하단에 고정 */
-    .st-key-chat_input_bar {
-        position: fixed;
-        bottom: 0;
-        left: 50%;
-        transform: translateX(-50%);
-        width: min(100%, 800px);
-        padding: 12px 20px 20px 20px;
-        background-color: var(--background-color, white);
-        z-index: 999;
-    }
-
-    /* 전송 및 클립 버튼 높이 */
-    .st-key-chat_input_bar button {
-        height: 38px;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+def restore_chat(index):
+    archive = st.session_state.chat_archive
+    selected = archive.pop(index)
+    if st.session_state.messages:
+        archive.append({"messages": list(st.session_state.messages),
+                        "thread_id": st.session_state.thread_id,
+                        "results": st.session_state.get("display_results", {})})
+    st.session_state.messages = selected["messages"]
+    st.session_state.thread_id = selected["thread_id"]
+    st.session_state.display_results = selected["results"]
+    st.session_state.final_answer = next((m["content"] for m in reversed(selected["messages"])
+                                         if m["role"] == "assistant"), None)
+    rows = selected["results"].get("orders", [])
+    st.session_state.order_quantity = rows[-1]["주문량(개)"] if rows else None
+    st.session_state.pop("analysis_choice", None)
 
 
-# ------------------------------------------
-# 8-2. 대화 내역 출력
-# ------------------------------------------
-
-for message in st.session_state.messages:
-
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
+@st.cache_data
+def image_data_uri(path):
+    return "data:image/png;base64," + base64.b64encode(Path(path).read_bytes()).decode("ascii")
 
 
-# ------------------------------------------
-# 8-3. 하단 고정 입력창
-# ------------------------------------------
+st.markdown("""
+<style>
+:root { --sil-ink:#392822; --sil-peach:#FFC5B3;
+    --sil-title:32px; --sil-subtitle:22px; --sil-body:16px; }
+.stApp { background:#FFF8F5; color:var(--sil-ink); }
+[data-testid="stHeader"] { background:rgba(255,255,255,.95); }
+.block-container { max-width:1600px; padding:4.5rem 2rem 2rem; }
+[data-testid="stSidebar"] { background:#FFFFFF; border-right:1px solid #F3E4DD; }
+[data-testid="stSidebar"] hr { border-color:#F5E9E3; margin:1.3rem 0; }
+h1,h2,h3,h4 { color:#392822; letter-spacing:-.04em; }
+.stButton > button, .stDownloadButton > button {
+    border:1px solid #F2D5C8; border-radius:12px; color:#392822; background:#FFFFFF; }
+.stButton > button:hover, .stDownloadButton > button:hover { background:#FFF1EB; border-color:#EBAE97; color:#392822; }
+.stButton > button[kind="primary"] { background:#FFC5B3; border-color:#FFC5B3; color:#392822; }
+[data-testid="stBaseButton-segmented_controlActive"] { background:#FFC5B3; color:#392822; border-color:#FFC5B3; }
+[data-testid="stBaseButton-segmented_control"] { background:#FFFAF8; border-color:#F4DCD1; color:#594039; }
+[data-testid="stMetricValue"] { color:#392822; font-size:var(--sil-title); font-weight:650; }
+[data-testid="stMetricLabel"] { color:#8A7B75; }
+[data-testid="stCaptionContainer"] { color:#897B76; }
+.st-key-chat_panel, .st-key-analysis_panel {
+    background:#FFFFFF; border:1px solid #F5E6DF; border-radius:18px; padding:22px;
+    box-shadow:0 6px 24px rgba(90,50,30,.025); }
+[data-testid="stChatMessage"] { background:transparent; border:none; padding:10px 0; }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+    background:#FFF2ED; border-radius:16px; padding:14px; }
+[data-testid="stChatMessageAvatarUser"] { background:#FFE5DA; color:#604438; }
+[data-testid="stChatMessage"] img { object-fit:contain; border-radius:0; }
+[data-testid="stChatInput"] { border:1px solid #F1CFC1; background:#FFFFFF; border-radius:14px; }
+[data-testid="stChatInput"] textarea { color:#392822; }
+[data-testid="stChatInputSubmitButton"] { background:#FFC5B3; color:#392822; border-radius:10px; }
+.sil-topline { display:flex; justify-content:space-between; align-items:center; gap:12px;
+    font-size:var(--sil-body); color:#7E706A; margin-bottom:18px; }
+.sil-badge { background:#FFEFE8; padding:6px 12px; border-radius:30px; font-size:var(--sil-body); }
+.sil-hero { position:relative; overflow:hidden; min-height:210px; border-radius:18px;
+    background:white; margin-bottom:22px; border:1px solid #F6E7E0; }
+.sil-hero-photo { position:absolute; right:0; top:0; width:58%; height:100%;
+    background-size:cover; background-position:center 30%; }
+.sil-hero-photo::after { content:''; position:absolute; inset:0;
+    background:linear-gradient(90deg,#FFFFFF 0%,rgba(255,255,255,.4) 25%,transparent 55%); }
+.sil-hero-copy { position:relative; z-index:1; padding:32px; width:59%; }
+.sil-hero h1 { font-size:var(--sil-title); line-height:1.28; font-weight:750; margin:0 0 14px; padding:0; }
+.sil-hero p { color:#85716A; font-size:var(--sil-body); margin:0; }
+.sil-eyebrow { color:#8E776C; font-size:var(--sil-body); letter-spacing:.12em; margin:0 0 16px; }
+.sil-empty { padding:50px 15px; text-align:center; color:#97837A; }
+.sil-empty strong { display:block; color:#60493F; font-size:var(--sil-subtitle); margin-bottom:14px; }
+/* 제목 / 소제목 / 본문 세 단계의 공통 타이포그래피 */
+.stApp h1, .stApp [data-testid="stMetricValue"] { font-size:var(--sil-title) !important; }
+.stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+.sil-empty strong { font-size:var(--sil-subtitle) !important; line-height:1.4; }
+.stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea,
+.stApp button, .stApp [data-testid="stCaptionContainer"],
+.stApp [data-testid="stCaptionContainer"] p,
+.stApp [data-testid="stMetricLabel"] p,
+.stApp [data-baseweb="select"] { font-size:var(--sil-body) !important; line-height:1.6; }
+.sil-brand-logo { width:100%; max-width:250px; height:112px; overflow:hidden; }
+.sil-brand-logo img { width:100%; height:100%; object-fit:contain;
+    transform:scale(1.5); transform-origin:52% 52%; }
+/* 양쪽 패널은 동일한 외곽 높이, 긴 결과는 패널 안에서 스크롤 */
+.st-key-chat_panel, .st-key-analysis_panel { box-sizing:border-box; }
+@media(max-width:900px) {
+    .block-container { padding:4.5rem 1rem 2rem; }
+    .sil-hero-copy { width:75%; padding:24px; }
+    .sil-hero-photo { opacity:.45; width:70%; }
+    .sil-hero { min-height:180px; }
+    [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] .st-key-chat_panel) { flex-direction:column; }
+    [data-testid="stColumn"]:has(.st-key-chat_panel), [data-testid="stColumn"]:has(.st-key-analysis_panel) { width:100%; flex:1 1 100%; }
+    .st-key-chat_panel, .st-key-analysis_panel { padding:16px; }
+}
+</style>
+""", unsafe_allow_html=True)
 
-with st.container(key="chat_input_bar"):
+assets = Path(__file__).parent / "assets"
+logo_path = assets / "sil-logo.png"
+assistant_logo_path = assets / "taekwang-wordmark.png"
+assistant_avatar = str(assistant_logo_path) if assistant_logo_path.exists() else None
 
-    col_input, col_send, col_csv = st.columns(
-        [8, 1, 1],
-        vertical_alignment="bottom",
-        gap="small"
+with st.sidebar:
+    if logo_path.exists():
+        st.markdown(
+            f'<div class="sil-brand-logo"><img src="{image_data_uri(str(logo_path))}" alt="SIL 로고"></div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown('<div class="sil-eyebrow">PURCHASING AI</div>', unsafe_allow_html=True)
+    st.button("새 대화", icon=":material/add:", type="primary", width="stretch", on_click=start_new_chat)
+    # 단일 페이지 앱의 현재 메뉴 표시: 페이지 탐색 API를 사용하지 않습니다.
+    st.markdown(
+        '<div aria-current="page" style="background:#FFF1EB; color:#392822; '
+        'border-radius:12px; padding:14px 16px; font-weight:600; text-align:center; margin-bottom:12px;">구매 어시스턴트</div>',
+        unsafe_allow_html=True,
     )
+    if st.button("주문 보고서", icon=":material/description:", width="stretch",
+                 disabled=not st.session_state.get("display_results", {}).get("orders")):
+        show_order_report()
+    st.divider()
+    st.caption("분석 내역 · 현재 대화")
+    analysis_indices = [i for i,m in enumerate(st.session_state.messages)
+                        if m.get("results", {}).get("sales") or m.get("results", {}).get("orders")]
+    if analysis_indices:
+        def analysis_label(i):
+            return next((m["content"][:40] for m in reversed(st.session_state.messages[:i])
+                         if m["role"] == "user"), "분석 결과")
+        choices = ["latest", *reversed(analysis_indices)]
+        if st.session_state.get("analysis_choice") not in choices:
+            st.session_state.pop("analysis_choice", None)
+        selected = st.selectbox("표시할 분석", choices, key="analysis_choice",
+                                format_func=lambda i: "가장 최근 질문" if i == "latest" else analysis_label(i),
+                                label_visibility="collapsed")
+    else:
+        selected = "latest"
+        st.caption("질문 후 분석 내역이 표시됩니다.")
+    st.divider()
+    st.caption("이전 대화 · 현재 세션")
+    for index, chat in reversed(list(enumerate(st.session_state.get("chat_archive", [])))):
+        title = next((m["content"] for m in chat["messages"] if m["role"] == "user"), "이전 대화")
+        st.button(title[:32], key=f"restore_{chat['thread_id']}", icon=":material/chat:",
+                  width="stretch", on_click=restore_chat, args=(index,))
+    st.caption("세션이 종료되면 대화 보관함도 초기화됩니다.")
+    st.divider()
+    st.markdown(":material/account_circle:　구매 담당자")
 
-    # 프롬프트 입력창
-    with col_input:
+st.markdown('<div class="sil-topline"><span>워크스페이스 / <b>구매 어시스턴트</b></span><span class="sil-badge">SIL · 구매 의사결정 지원</span></div>', unsafe_allow_html=True)
+banner_path = assets / "safin-banner.png"
+banner_style = f"background-image:url('{image_data_uri(str(banner_path))}');" if banner_path.exists() else ""
+st.markdown(f"""<section class="sil-hero">
+<div class="sil-hero-photo" style="{banner_style}"></div>
+<div class="sil-hero-copy"><h1>AI 구매 어시스턴트</h1>
+<p>판매 예측부터 발주 계획까지, AI와 함께하세요.</p></div></section>""", unsafe_allow_html=True)
 
-        st.text_input(
-            label="질문 입력",
-            placeholder="무엇이든 물어보세요.",
-            key="prompt_input",
-            label_visibility="collapsed",
-            on_change=send_message
-        )
+chat_col, analysis_col = st.columns([0.95, 1.25], gap="medium")
+PANEL_HEIGHT = 740
+with chat_col, st.container(key="chat_panel", height=PANEL_HEIGHT, border=False):
+    title_icon, title_text = st.columns([1, 6], vertical_alignment="center")
+    with title_icon:
+        if assistant_avatar:
+            st.image(assistant_avatar, width=55)
+    title_text.markdown("### AI 어시스턴트")
+    with st.container(height=430, border=False):
+        if not st.session_state.messages:
+            st.markdown('<div class="sil-empty"><strong>어떤 구매 계획을 세울까요?</strong>제품 SKU와 궁금한 판매량 또는 주문량을 입력해 주세요.</div>', unsafe_allow_html=True)
+            st.caption("질문 예시 · A-SRM-100의 재고를 확인하고 추가 주문량을 계산해줘.")
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"], avatar=assistant_avatar if message["role"] == "assistant" else None):
+                st.write(message["content"])
+    st.chat_input("제품과 궁금한 내용을 입력하세요", key="prompt_input", on_submit=send_message)
+    st.caption("판매량과 주문 결과는 오른쪽 분석 영역에서 확인하세요.")
 
-    # 전송 버튼
-    with col_send:
-
-        st.button(
-            label="➤",
-            key="send_button",
-            help="메시지 전송",
-            on_click=send_message,
-            use_container_width=True
-        )
-
-    # 클립 버튼
-    with col_csv:
-
-        if st.button(
-            label="",
-            icon=":material/attach_file:",
-            key="csv_button",
-            help="재고 주문 보고서 보기",
-            use_container_width=True,
-            disabled=(
-                st.session_state.final_answer is None
-            )
-        ):
-
-            show_order_report()
+with analysis_col, st.container(key="analysis_panel", height=PANEL_HEIGHT, border=False):
+    st.markdown("### 판매 및 재고 분석")
+    results = (st.session_state.get("display_results", {}) if selected == "latest"
+               else st.session_state.messages[selected]["results"])
+    if results.get("sales") or results.get("orders"):
+        st.caption("최근 질문의 결과" if selected == "latest" else f"선택한 분석 · {analysis_label(selected)}")
+        render_results(results, f"workspace_{st.session_state.thread_id}_{selected}")
+    else:
+        st.markdown('<div class="sil-empty"><strong>분석 결과를 기다리고 있어요</strong>판매량이나 재고 주문량을 질문하면<br>차트와 주문 제안이 이곳에 표시됩니다.</div>', unsafe_allow_html=True)
+        st.divider()
+        st.markdown("**판매량 예측**　주차별 수량과 판매 사이트 비교")
+        st.markdown("**재고 주문 제안**　국내·국외 구분과 CSV 저장")
+        st.caption("현재 판매량은 고정 예시값이며 주문 계산은 국내 창고 기준입니다.")
